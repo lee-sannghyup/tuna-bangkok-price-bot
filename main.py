@@ -1,4 +1,16 @@
 # -*- coding: utf-8 -*-
+"""
+Bangkok Skipjack Proxy + 선행변수(FAD/유가/어획proxy) + SARIMAX 3개월 예측 + 차트 + 이메일(CID)
+
+[필수 Secrets]
+- EMAIL_ADDR, EMAIL_PASSWORD, RECEIVER_ADDR
+- (권장) GOOGLE_API_KEY, GOOGLE_CSE_CX  -> 최신 INFOFISH ITN PDF 자동 검색
+
+[옵션 우회 스위치(강력)]
+- ITN_PDF_URL : CSE가 400/403 등으로 실패할 때, 이 URL이 있으면 "검색 없이" 바로 PDF 사용
+  예) https://v4.infofish.org/media/attachments/2025/07/08/final--itn-6-2025_updated.pdf
+"""
+
 import os, re, io, ssl, datetime as dt
 import requests
 import pandas as pd
@@ -11,9 +23,15 @@ from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
 
 
-# ===== ENV =====
+# =========================
+# ENV
+# =========================
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 GOOGLE_CSE_CX  = os.getenv("GOOGLE_CSE_CX", "")
+
+# (옵션) CSE 실패 시 이 URL로 바로 실행
+ITN_PDF_URL = os.getenv("ITN_PDF_URL", "").strip()
+
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 EMAIL_ADDR = os.getenv("EMAIL_ADDR", "")
@@ -29,24 +47,12 @@ POS_PATTERNS = [r"strong catches", r"improved catches", r"higher catches", r"goo
 NEG_PATTERNS = [r"poor catches", r"low catches", r"weaker catches", r"declining catches"]
 
 
+# =========================
+# Utils
+# =========================
 def month_start_kst():
     kst = dt.datetime.utcnow() + dt.timedelta(hours=9)
     return pd.Timestamp(dt.date(kst.year, kst.month, 1))
-
-
-def google_cse_top_pdf_url(query: str) -> str:
-    if not (GOOGLE_API_KEY and GOOGLE_CSE_CX):
-        raise RuntimeError("GOOGLE_API_KEY / GOOGLE_CSE_CX 설정 필요")
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {"key": GOOGLE_API_KEY, "cx": GOOGLE_CSE_CX, "q": query, "num": 5}
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    for item in data.get("items", []):
-        link = item.get("link", "")
-        if link.lower().endswith(".pdf") and "infofish" in link.lower():
-            return link
-    raise RuntimeError("INFOFISH ITN PDF 링크를 찾지 못했습니다(검색어/엔진 설정 확인).")
 
 
 def download_bytes(url: str) -> bytes:
@@ -64,6 +70,61 @@ def extract_text_first_pages(pdf_bytes: bytes, max_pages=15) -> str:
     return re.sub(r"\s+", " ", text)
 
 
+# =========================
+# Google CSE (에러 로그 강화)
+# =========================
+def google_cse_top_pdf_url(query: str) -> str:
+    if not (GOOGLE_API_KEY and GOOGLE_CSE_CX):
+        raise RuntimeError("GOOGLE_API_KEY / GOOGLE_CSE_CX 설정 필요")
+
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {"key": GOOGLE_API_KEY, "cx": GOOGLE_CSE_CX, "q": query, "num": 5}
+    r = requests.get(url, params=params, timeout=30)
+
+    # ★ 400/403 등 실패 시, 원인(JSON)을 그대로 로그에 출력
+    if not r.ok:
+        print("=== Google CSE Request Failed ===")
+        print("Status:", r.status_code)
+        try:
+            print("Body(JSON):", r.json())
+        except Exception:
+            print("Body(Text):", r.text)
+        print("Tip: cx 값에 'cx=' 포함/공백/줄바꿈이 있거나, Custom Search API Enable 안 됐을 가능성이 큼")
+        r.raise_for_status()
+
+    data = r.json()
+    for item in data.get("items", []):
+        link = item.get("link", "")
+        if link.lower().endswith(".pdf") and "infofish" in link.lower():
+            return link
+
+    raise RuntimeError("CSE 검색 결과에 PDF가 없습니다. 검색어/엔진 설정 또는 사이트 제한을 확인하세요.")
+
+
+def resolve_itn_pdf_url() -> str:
+    """
+    1) ITN_PDF_URL 있으면 그걸 사용(검색 없이 바로)
+    2) 없으면 Google CSE로 검색
+    """
+    if ITN_PDF_URL:
+        return ITN_PDF_URL
+
+    # CSE 실패하면 우회 스위치를 안내
+    try:
+        return google_cse_top_pdf_url(SEARCH_QUERY)
+    except Exception as e:
+        raise RuntimeError(
+            "Google CSE로 ITN PDF 검색 실패.\n"
+            "해결 1) Google Cloud에서 'Custom Search API' Enable 확인\n"
+            "해결 2) GOOGLE_CSE_CX 값이 'cx=' 없이 값만 들어갔는지 확인\n"
+            "임시 우회) ITN_PDF_URL 환경변수(Secret)로 최신 ITN PDF URL을 넣으면 검색 없이 실행됩니다.\n"
+            f"원인: {e}"
+        )
+
+
+# =========================
+# Extract: Price + Catch proxy
+# =========================
 def extract_skipjack_thailand_price(text: str) -> dict:
     # range: US$ 1,400-1,450/MT
     p_range = re.compile(
@@ -107,6 +168,9 @@ def calc_catch_score(text: str) -> float:
     return float(pos - neg)
 
 
+# =========================
+# Brent (FRED)
+# =========================
 def load_brent_monthly() -> pd.DataFrame:
     df = pd.read_csv(FRED_BRENT_MONTHLY_CSV)
     df["DATE"] = pd.to_datetime(df["DATE"])
@@ -117,11 +181,17 @@ def load_brent_monthly() -> pd.DataFrame:
     return df[["month", "brent"]]
 
 
+# =========================
+# FAD flag (완전 자동 룰)
+# =========================
 def fad_flag(month_ts: pd.Timestamp) -> int:
-    # 완전 자동 룰(기본): 7~8월=1
+    # 기본 룰: 7~8월=1
     return 1 if int(month_ts.month) in (7, 8) else 0
 
 
+# =========================
+# History CSV
+# =========================
 def load_history(path: str) -> pd.DataFrame:
     if os.path.exists(path):
         df = pd.read_csv(path)
@@ -151,6 +221,9 @@ def upsert_history(df: pd.DataFrame, month_ts: pd.Timestamp, low: int, high: int
     return df.sort_values("month")
 
 
+# =========================
+# Train + Forecast
+# =========================
 def build_train(hist: pd.DataFrame) -> pd.DataFrame:
     brent = load_brent_monthly()
     df = hist.merge(brent, on="month", how="left")
@@ -196,6 +269,9 @@ def sarimax_forecast_3m(train: pd.DataFrame) -> pd.DataFrame:
     })
 
 
+# =========================
+# Chart + Email (CID)
+# =========================
 def make_chart_png(hist_csv: str, out_png="price_chart.png", last_n=12) -> str:
     df = pd.read_csv(hist_csv)
     df["month"] = pd.to_datetime(df["month"])
@@ -296,7 +372,7 @@ def make_html(m0, price_info, pdf_url, catch_score, hist, pred) -> str:
 def main():
     m0 = month_start_kst()
 
-    pdf_url = google_cse_top_pdf_url(SEARCH_QUERY)
+    pdf_url = resolve_itn_pdf_url()
     pdf_bytes = download_bytes(pdf_url)
     text = extract_text_first_pages(pdf_bytes, max_pages=15)
 
@@ -310,7 +386,6 @@ def main():
     train = build_train(hist)
     pred = sarimax_forecast_3m(train) if len(train) >= 6 else pd.DataFrame()
 
-    # 차트 생성
     chart_path = make_chart_png(HISTORY_CSV, "price_chart.png", last_n=12)
 
     subject = f"[참치 원어] Bangkok Proxy + 3개월 예측 ({m0.strftime('%Y-%m')})"
