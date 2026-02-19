@@ -2,7 +2,7 @@ name: Bangkok Price + Forecast Bot
 
 on:
   schedule:
-    - cron: "0 22 * * *"   # 매일 07:00 KST
+    - cron: "0 22 * * *"   # 매일 07:00 KST (UTC 22:00)
   workflow_dispatch:
 
 jobs:
@@ -20,6 +20,20 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
+      # ✅ 키가 "주입"되고 있는지만 확인(길이만 출력)
+      - name: Debug env (length only)
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_CSE_CX: ${{ secrets.GOOGLE_CSE_CX }}
+        run: |
+          python - << 'PY'
+          import os
+          k=os.getenv("GOOGLE_API_KEY","")
+          cx=os.getenv("GOOGLE_CSE_CX","")
+          print("GOOGLE_API_KEY length:", len(k))
+          print("GOOGLE_CSE_CX length:", len(cx))
+          PY
+
       - name: Run
         env:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
@@ -29,5 +43,6 @@ jobs:
           RECEIVER_ADDR: ${{ secrets.RECEIVER_ADDR }}
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "465"
+          # (선택 우회) ITN_PDF_URL: ${{ secrets.ITN_PDF_URL }}
         run: |
           python main.py
